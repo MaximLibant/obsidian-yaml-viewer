@@ -18,12 +18,12 @@ YAML Viewer is a read-only Obsidian plugin for browsing `.yaml` and `.yml` files
 ## Features
 
 - Opens `.yaml` and `.yml` files in a dedicated Obsidian view.
-- Shows maps, sequences, scalars, aliases, document comments, node comments, and parse errors.
+- Shows maps, sequences, scalars, aliases, document comments, node comments, and parse errors. Turn off the **Show comments** setting to leave comments out of the tree.
 - Filters the tree by key, value, or YAML path.
 - Provides a right-side outline for fast navigation through large YAML files.
 - Includes expand/collapse controls, copy raw YAML, and copy-path buttons.
 - Shows raw YAML with lightweight syntax highlighting and line numbers.
-- Stays read-only by design: it never writes back to your YAML files.
+- Stays read-only by default. Editing the raw YAML text is opt-in.
 
 ## Privacy and clipboard behavior
 
@@ -31,7 +31,16 @@ YAML Viewer does not make network requests and does not send vault content to ex
 
 ## Why read-only?
 
-YAML files often contain comments, anchors, ordering, and formatting that matter. A form editor can easily reserialize YAML and damage those details. YAML Viewer intentionally does not write to disk, so it cannot reformat or corrupt source-of-truth configuration files.
+YAML files often contain comments, anchors, ordering, and formatting that matter. A form editor can easily reserialize YAML and damage those details. By default, YAML Viewer does not write to disk, so it cannot reformat or corrupt source-of-truth configuration files.
+
+## Editing
+
+Files open in the read view by default. Click **Edit YAML** in the toolbar to switch to the editor, and click it again to return to the read view. The **Default view** setting selects the view a file opens in.
+
+- The editor saves the text as typed. It never parses the YAML and writes it back, so comments, anchors, ordering, and formatting stay unchanged.
+- Line endings are kept. Files with mixed line endings stay read-only.
+- Click the arrow in the gutter to fold or unfold an indented block. Folding works in both views and never changes the file.
+- The tree and outline stay read-only and show the edited text when you return to the read view.
 
 ## Installation
 

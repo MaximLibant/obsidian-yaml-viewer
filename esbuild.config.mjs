@@ -9,7 +9,8 @@ await esbuild.build({
   },
   bundle: true,
   entryPoints: ["src/main.ts"],
-  external: ["obsidian"],
+  // Obsidian provides these at runtime. Bundling a second copy breaks the editor.
+  external: ["obsidian", "@codemirror/commands", "@codemirror/language", "@codemirror/state", "@codemirror/view"],
   format: "cjs",
   logLevel: "info",
   minify: production,

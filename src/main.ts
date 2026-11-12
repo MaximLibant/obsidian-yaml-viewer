@@ -1,9 +1,36 @@
 import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  indentWithTab,
+} from "@codemirror/commands";
+import { foldGutter, foldService } from "@codemirror/language";
+import {
+  Compartment,
+  EditorState,
+  RangeSetBuilder,
+  type Extension,
+  type Text,
+} from "@codemirror/state";
+import {
+  Decoration,
+  EditorView,
+  ViewPlugin,
+  keymap,
+  lineNumbers,
+  type DecorationSet,
+  type ViewUpdate,
+} from "@codemirror/view";
+import {
+  App,
   Notice,
   Plugin,
+  PluginSettingTab,
+  Setting,
   TFile,
   TextFileView,
   WorkspaceLeaf,
+  debounce,
   setIcon,
 } from "obsidian";
 import {
@@ -26,8 +53,34 @@ interface OutlineItem {
   count: number;
 }
 
+type ViewMode = "read" | "edit";
+
+interface YamlViewerSettings {
+  defaultMode: ViewMode;
+  showComments: boolean;
+}
+
+interface ViewLayout {
+  errors: HTMLElement;
+  body: HTMLElement;
+  tree: HTMLElement;
+  search: HTMLInputElement;
+  raw: HTMLDetailsElement;
+  editButton: HTMLButtonElement;
+  outlineItems: OutlineItem[];
+}
+
 export default class YamlViewerPlugin extends Plugin {
+  settings: YamlViewerSettings = { defaultMode: "read", showComments: true };
+
   async onload(): Promise<void> {
+    const saved = (await this.loadData()) as Partial<YamlViewerSettings> | null;
+    this.settings = {
+      defaultMode: saved?.defaultMode === "edit" ? "edit" : "read",
+      showComments: saved?.showComments !== false,
+    };
+    this.addSettingTab(new YamlViewerSettingTab(this.app, this));
+
     this.registerView(
       VIEW_TYPE_YAML_VIEWER,
       (leaf) => new YamlViewerView(leaf, this),
@@ -57,10 +110,58 @@ export default class YamlViewerPlugin extends Plugin {
       active: true,
     });
   }
+
+}
+
+class YamlViewerSettingTab extends PluginSettingTab {
+  private readonly plugin: YamlViewerPlugin;
+
+  constructor(app: App, plugin: YamlViewerPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  display(): void {
+    this.containerEl.empty();
+    new Setting(this.containerEl)
+      .setName("Default view")
+      .setDesc("The view a YAML file opens in. Edits are saved as typed and are never reformatted.")
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("read", "Read-only")
+          .addOption("edit", "Read/write")
+          .setValue(this.plugin.settings.defaultMode)
+          .onChange(async (value) => {
+            this.plugin.settings.defaultMode = value === "edit" ? "edit" : "read";
+            await this.plugin.saveData(this.plugin.settings);
+          });
+      });
+    new Setting(this.containerEl)
+      .setName("Show comments")
+      .setDesc("Show YAML comments in the tree view.")
+      .addToggle((toggle) => {
+        toggle
+          .setValue(this.plugin.settings.showComments)
+          .onChange(async (value) => {
+            this.plugin.settings.showComments = value;
+            await this.plugin.saveData(this.plugin.settings);
+            this.app.workspace.getLeavesOfType(VIEW_TYPE_YAML_VIEWER).forEach((leaf) => {
+              if (leaf.view instanceof YamlViewerView) leaf.view.renderTree();
+            });
+          });
+      });
+  }
 }
 
 class YamlViewerView extends TextFileView {
   private readonly plugin: YamlViewerPlugin;
+  private readonly lock = new Compartment();
+  private readonly refreshTree = debounce(() => this.renderTree(), 300, true);
+  private editor: EditorView | null = null;
+  private layout: ViewLayout | null = null;
+  private editing = false;
+  // null when the file mixes line endings. Saving would normalize them, so the file stays read-only.
+  private lineSeparator: string | null = "\n";
 
   constructor(leaf: WorkspaceLeaf, plugin: YamlViewerPlugin) {
     super(leaf);
@@ -79,9 +180,19 @@ class YamlViewerView extends TextFileView {
     return "braces";
   }
 
-  setViewData(data: string): void {
+  setViewData(data: string, clear: boolean): void {
     this.data = data;
-    this.render();
+    if (clear || !this.editor) {
+      this.render();
+      return;
+    }
+    // Reached for external changes. A reload drops the cursor and undo history, so skip it when the text matches.
+    if (data !== this.editor.state.sliceDoc()) {
+      this.loadEditor();
+      // The new text can mix line endings, which ends edit mode.
+      if (this.editing) this.setEditing(true);
+      this.renderTree();
+    }
   }
 
   getViewData(): string {
@@ -90,11 +201,80 @@ class YamlViewerView extends TextFileView {
 
   clear(): void {
     this.data = "";
+    this.destroyEditor();
+    this.layout = null;
     this.contentEl.empty();
+  }
+
+  protected async onClose(): Promise<void> {
+    this.destroyEditor();
+    await super.onClose();
+  }
+
+  // Edit mode shows the editor in place of the tree and outline.
+  private setEditing(editing: boolean): void {
+    if (!this.layout) return;
+    if (editing && this.lineSeparator === null) {
+      new Notice("This file mixes line endings, so it stays read-only.");
+      editing = false;
+    }
+    this.editing = editing;
+    this.editor?.dispatch({ effects: this.lock.reconfigure(this.lockExtension()) });
+    this.contentEl.toggleClass("yaml-viewer--editing", editing);
+
+    const { raw, editButton } = this.layout;
+    raw.open = editing;
+    const label = editing ? "Back to read view" : "Edit YAML";
+    setIcon(editButton, editing ? "book-open" : "pencil");
+    editButton.setAttribute("aria-label", label);
+    editButton.title = label;
+  }
+
+  private lockExtension(): Extension {
+    return [EditorState.readOnly.of(!this.editing), EditorView.editable.of(this.editing)];
+  }
+
+  private destroyEditor(): void {
+    this.editor?.destroy();
+    this.editor = null;
+  }
+
+  // Replaces the editor state with this.data, which drops the undo history.
+  private loadEditor(): void {
+    if (!this.layout) return;
+    this.lineSeparator = detectLineSeparator(this.data);
+
+    const state = EditorState.create({
+      doc: this.data,
+      extensions: [
+        lineNumbers(),
+        foldGutter(),
+        foldService.of((state, lineStart) => yamlFoldRange(state.doc, lineStart)),
+        history(),
+        keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+        yamlHighlighter,
+        this.lineSeparator === null ? [] : EditorState.lineSeparator.of(this.lineSeparator),
+        this.lock.of(this.lockExtension()),
+        EditorView.updateListener.of((update) => {
+          if (!update.docChanged) return;
+          // The text is saved as typed. Nothing is parsed and written back.
+          this.data = update.state.sliceDoc();
+          this.requestSave();
+          this.refreshTree();
+        }),
+      ],
+    });
+
+    if (this.editor) {
+      this.editor.setState(state);
+    } else {
+      this.editor = new EditorView({ state, parent: this.layout.raw });
+    }
   }
 
   private render(): void {
     const container = this.contentEl;
+    this.destroyEditor();
     container.empty();
     container.addClass("yaml-viewer");
 
@@ -123,10 +303,60 @@ class YamlViewerView extends TextFileView {
     const expandButton = createButton(toolbar, "chevrons-down", "Expand all");
     const collapseButton = createButton(toolbar, "chevrons-up", "Collapse all");
     const rawButton = createButton(toolbar, "file-code-2", "Copy raw YAML");
+    const editButton = createButton(toolbar, "pencil", "Edit YAML");
+    expandButton.addClass("yaml-viewer__tree-control");
+    collapseButton.addClass("yaml-viewer__tree-control");
 
     rawButton.addEventListener("click", () => {
       void copyToClipboard(this.data, "YAML copied");
     });
+
+    const errors = container.createDiv();
+    const body = container.createDiv({ cls: "yaml-viewer__body" });
+    const main = body.createDiv({ cls: "yaml-viewer__main" });
+    const tree = main.createDiv({ cls: "yaml-viewer__tree" });
+    const raw = main.createEl("details", { cls: "yaml-viewer__raw" });
+    raw.createEl("summary", { text: "Raw YAML" });
+    const layout: ViewLayout = { errors, body, tree, search: searchInput, raw, editButton, outlineItems: [] };
+    this.layout = layout;
+
+    editButton.addEventListener("click", () => {
+      this.setEditing(!this.editing);
+      if (this.editing) this.editor?.focus();
+    });
+
+    searchInput.addEventListener("input", () => {
+      applyFilter(tree, layout.outlineItems, searchInput.value);
+    });
+
+    expandButton.addEventListener("click", () => {
+      tree.querySelectorAll("details").forEach((detail) => {
+        detail.setAttribute("open", "");
+      });
+    });
+
+    collapseButton.addEventListener("click", () => {
+      tree.querySelectorAll("details").forEach((detail) => {
+        detail.removeAttribute("open");
+      });
+    });
+
+    // The editor cannot measure itself while the details element is closed.
+    raw.addEventListener("toggle", () => this.editor?.requestMeasure());
+    this.loadEditor();
+    this.setEditing(this.plugin.settings.defaultMode === "edit");
+
+    this.renderTree();
+  }
+
+  // Rebuilds the parts derived from the text. The editor is left alone so typing keeps focus.
+  renderTree(): void {
+    if (!this.layout) return;
+    const { errors, body, tree, search } = this.layout;
+    errors.empty();
+    tree.empty();
+    body.querySelector(".yaml-viewer__outline")?.remove();
+    this.layout.outlineItems = [];
 
     let documents: ReturnType<typeof parseAllDocuments> = [];
     try {
@@ -136,20 +366,17 @@ class YamlViewerView extends TextFileView {
         uniqueKeys: false,
       });
     } catch (error) {
-      renderFatalError(container, error);
-      renderRaw(container, this.data);
+      renderFatalError(errors, error);
       return;
     }
 
-    const errors = documents.flatMap((doc) => doc.errors);
-    if (errors.length > 0) {
-      renderParseErrors(container, errors);
+    const parseErrors = documents.flatMap((doc) => doc.errors);
+    if (parseErrors.length > 0) {
+      renderParseErrors(errors, parseErrors);
     }
 
-    const body = container.createDiv({ cls: "yaml-viewer__body" });
-    const main = body.createDiv({ cls: "yaml-viewer__main" });
-    const tree = main.createDiv({ cls: "yaml-viewer__tree" });
-    const outlineItems: OutlineItem[] = [];
+    const outlineItems = this.layout.outlineItems;
+    const { showComments } = this.plugin.settings;
 
     if (documents.length === 0 || documents.every((doc) => !doc.contents)) {
       tree.createDiv({
@@ -166,35 +393,18 @@ class YamlViewerView extends TextFileView {
           });
           docHeader.dataset.path = rootPath;
         }
-        renderDocumentCommentBefore(tree, doc.commentBefore);
+        if (showComments) renderDocumentCommentBefore(tree, doc.commentBefore);
         outlineItems.push(...collectOutline(doc.contents, rootPath, documents.length > 1 ? `Document ${index + 1}` : "root", 0));
-        renderNode(tree, doc.contents, rootPath, documents.length > 1 ? `Document ${index + 1}` : "root");
+        renderNode(tree, doc.contents, rootPath, documents.length > 1 ? `Document ${index + 1}` : "root", showComments);
       });
     }
 
     renderOutline(body, tree, outlineItems);
-
-    searchInput.addEventListener("input", () => {
-      applyFilter(tree, outlineItems, searchInput.value);
-    });
-
-    expandButton.addEventListener("click", () => {
-      tree.querySelectorAll("details").forEach((detail) => {
-        detail.setAttribute("open", "");
-      });
-    });
-
-    collapseButton.addEventListener("click", () => {
-      tree.querySelectorAll("details").forEach((detail) => {
-        detail.removeAttribute("open");
-      });
-    });
-
-    renderRaw(main, this.data);
+    applyFilter(tree, outlineItems, search.value);
   }
 }
 
-function renderNode(parent: HTMLElement, node: unknown, path: string, label: string): void {
+function renderNode(parent: HTMLElement, node: unknown, path: string, label: string, showComments: boolean): void {
   if (node === null) {
     renderScalar(parent, label, null, path);
     return;
@@ -202,17 +412,17 @@ function renderNode(parent: HTMLElement, node: unknown, path: string, label: str
 
   if (isMap(node)) {
     const details = createBranch(parent, label, path, "map", `${node.items.length} keys`);
-    node.items.forEach((item) => renderPair(details, item, path));
-    renderComment(details, node.comment);
+    node.items.forEach((item) => renderPair(details, item, path, showComments));
+    if (showComments) renderComment(details, node.comment);
     return;
   }
 
   if (isSeq(node)) {
     const details = createBranch(parent, label, path, "seq", `${node.items.length} items`);
     node.items.forEach((item, index) => {
-      renderNode(details, item, `${path}[${index}]`, `[${index}]`);
+      renderNode(details, item, `${path}[${index}]`, `[${index}]`, showComments);
     });
-    renderComment(details, node.comment);
+    if (showComments) renderComment(details, node.comment);
     return;
   }
 
@@ -223,19 +433,24 @@ function renderNode(parent: HTMLElement, node: unknown, path: string, label: str
 
   if (isScalar(node)) {
     renderScalar(parent, label, node.value, path);
-    renderComment(parent, node.comment);
+    if (showComments) renderComment(parent, node.comment);
     return;
   }
 
   renderScalar(parent, label, formatValue(node), path);
 }
 
-function renderPair(parent: HTMLElement, pair: { key: unknown; value: unknown }, parentPath: string): void {
+function renderPair(
+  parent: HTMLElement,
+  pair: { key: unknown; value: unknown },
+  parentPath: string,
+  showComments: boolean,
+): void {
   const keyText = stringifyKey(pair.key);
   const childPath = keyText.match(/^[A-Za-z_$][\w$-]*$/)
     ? `${parentPath}.${keyText}`
     : `${parentPath}[${JSON.stringify(keyText)}]`;
-  renderNode(parent, pair.value, childPath, keyText);
+  renderNode(parent, pair.value, childPath, keyText, showComments);
 }
 
 function createBranch(
@@ -272,7 +487,6 @@ function renderScalar(
   row.addClass(`yaml-viewer__type-${type}`);
   row.dataset.path = path;
   row.createSpan({ cls: "yaml-viewer__key", text: label });
-  row.createSpan({ cls: "yaml-viewer__badge", text: type });
   row.createSpan({ cls: "yaml-viewer__value", text: formatValue(value) });
   addCopyPathButton(row, path);
 }
@@ -299,13 +513,6 @@ function renderFatalError(parent: HTMLElement, error: unknown): void {
   const box = parent.createDiv({ cls: "yaml-viewer__errors" });
   box.createDiv({ cls: "yaml-viewer__errors-title", text: "Could not parse YAML" });
   box.createDiv({ cls: "yaml-viewer__error", text: getErrorMessage(error) });
-}
-
-function renderRaw(parent: HTMLElement, data: string): void {
-  const details = parent.createEl("details", { cls: "yaml-viewer__raw" });
-  details.createEl("summary", { text: "Raw YAML" });
-  const pre = details.createEl("pre");
-  renderHighlightedYaml(pre, data);
 }
 
 function renderComment(parent: HTMLElement, comment: string | null | undefined): void {
@@ -509,66 +716,143 @@ function openAncestors(element: HTMLElement): void {
   }
 }
 
-function renderHighlightedYaml(parent: HTMLElement, data: string): void {
-  const lines = data.split("\n");
-  lines.forEach((line, index) => {
-    const lineEl = parent.createDiv({ cls: "yaml-viewer__source-line" });
-    lineEl.createSpan({ cls: "yaml-viewer__line-number", text: String(index + 1) });
-    const code = lineEl.createSpan({ cls: "yaml-viewer__source-code" });
-    highlightYamlLine(code, line);
-  });
+// Returns null for mixed line endings, which the editor cannot write back unchanged.
+function detectLineSeparator(text: string): string | null {
+  if (!text.includes("\r")) return "\n";
+  return /\r(?!\n)|(?<!\r)\n/.test(text) ? null : "\r\n";
 }
 
-function highlightYamlLine(parent: HTMLElement, line: string): void {
+const TOKEN_MARKS = {
+  key: Decoration.mark({ class: "yaml-viewer__tok-key" }),
+  punctuation: Decoration.mark({ class: "yaml-viewer__tok-punctuation" }),
+  string: Decoration.mark({ class: "yaml-viewer__tok-string" }),
+  number: Decoration.mark({ class: "yaml-viewer__tok-number" }),
+  boolean: Decoration.mark({ class: "yaml-viewer__tok-boolean" }),
+  null: Decoration.mark({ class: "yaml-viewer__tok-null" }),
+  collection: Decoration.mark({ class: "yaml-viewer__tok-collection" }),
+  comment: Decoration.mark({ class: "yaml-viewer__tok-comment" }),
+};
+
+type TokenType = keyof typeof TOKEN_MARKS;
+
+interface YamlToken {
+  from: number;
+  to: number;
+  type: TokenType;
+}
+
+const yamlHighlighter = ViewPlugin.fromClass(
+  class {
+    decorations: DecorationSet;
+
+    constructor(view: EditorView) {
+      this.decorations = highlightVisibleLines(view);
+    }
+
+    update(update: ViewUpdate): void {
+      if (update.docChanged || update.viewportChanged) {
+        this.decorations = highlightVisibleLines(update.view);
+      }
+    }
+  },
+  { decorations: (plugin) => plugin.decorations },
+);
+
+function highlightVisibleLines(view: EditorView): DecorationSet {
+  const builder = new RangeSetBuilder<Decoration>();
+  // CodeMirror can split one very long line across two visible ranges. Visiting it twice would
+  // add ranges out of order, which the builder rejects.
+  let nextLineStart = 0;
+  for (const { from, to } of view.visibleRanges) {
+    for (let pos = Math.max(from, nextLineStart); pos <= to; ) {
+      const line = view.state.doc.lineAt(pos);
+      for (const token of tokenizeYamlLine(line.text)) {
+        builder.add(line.from + token.from, line.from + token.to, TOKEN_MARKS[token.type]);
+      }
+      pos = line.to + 1;
+      nextLineStart = pos;
+    }
+  }
+  return builder.finish();
+}
+
+// Tokens are non-empty and in source order, as the range builder requires.
+function tokenizeYamlLine(line: string): YamlToken[] {
   if (line.trimStart().startsWith("#")) {
-    parent.createSpan({ cls: "yaml-viewer__tok-comment", text: line });
-    return;
+    return [{ from: 0, to: line.length, type: "comment" }];
   }
 
+  const tokens: YamlToken[] = [];
   const hashIndex = findCommentStart(line);
   const codePart = hashIndex >= 0 ? line.slice(0, hashIndex) : line;
-  const commentPart = hashIndex >= 0 ? line.slice(hashIndex) : "";
   const keyMatch = codePart.match(/^(\s*(?:-\s*)?)([^:#\n][^:\n]*?)(\s*:\s*)(.*)$/);
 
+  let valueStart = 0;
   if (keyMatch) {
-    parent.appendText(keyMatch[1]);
-    parent.createSpan({ cls: "yaml-viewer__tok-key", text: keyMatch[2] });
-    parent.createSpan({ cls: "yaml-viewer__tok-punctuation", text: keyMatch[3] });
-    highlightYamlValue(parent, keyMatch[4]);
-  } else {
-    highlightYamlValue(parent, codePart);
+    const keyStart = keyMatch[1].length;
+    const punctuationStart = keyStart + keyMatch[2].length;
+    valueStart = punctuationStart + keyMatch[3].length;
+    tokens.push({ from: keyStart, to: punctuationStart, type: "key" });
+    tokens.push({ from: punctuationStart, to: valueStart, type: "punctuation" });
   }
 
-  if (commentPart) {
-    parent.createSpan({ cls: "yaml-viewer__tok-comment", text: commentPart });
-  }
-}
-
-function highlightYamlValue(parent: HTMLElement, value: string): void {
+  const value = codePart.slice(valueStart);
   const trimmed = value.trim();
-  const leading = value.slice(0, value.length - value.trimStart().length);
-  const trailing = value.slice(value.trimEnd().length);
-
-  parent.appendText(leading);
-  if (!trimmed) {
-    parent.appendText(trailing);
-    return;
+  if (trimmed) {
+    const from = valueStart + value.length - value.trimStart().length;
+    tokens.push({ from, to: from + trimmed.length, type: tokenType(trimmed) });
   }
 
-  const cls = tokenClass(trimmed);
-  parent.createSpan({ cls, text: trimmed });
-  parent.appendText(trailing);
+  if (hashIndex >= 0) {
+    tokens.push({ from: hashIndex, to: line.length, type: "comment" });
+  }
+
+  return tokens;
 }
 
-function tokenClass(value: string): string {
-  if (/^["'].*["']$/.test(value)) return "yaml-viewer__tok-string";
-  if (/^(true|false)$/i.test(value)) return "yaml-viewer__tok-boolean";
-  if (/^(null|~)$/i.test(value)) return "yaml-viewer__tok-null";
-  if (/^-?\d+(\.\d+)?$/.test(value)) return "yaml-viewer__tok-number";
+function tokenType(value: string): TokenType {
+  if (/^["'].*["']$/.test(value)) return "string";
+  if (/^(true|false)$/i.test(value)) return "boolean";
+  if (/^(null|~)$/i.test(value)) return "null";
+  if (/^-?\d+(\.\d+)?$/.test(value)) return "number";
   if ((value.startsWith("[") && value.endsWith("]")) || (value.startsWith("{") && value.endsWith("}"))) {
-    return "yaml-viewer__tok-collection";
+    return "collection";
   }
-  return "yaml-viewer__tok-string";
+  return "string";
+}
+
+// Folds a block by indentation. A key ending in ":" also takes "- " items at its own indentation.
+function yamlFoldRange(doc: Text, lineStart: number): { from: number; to: number } | null {
+  const header = doc.lineAt(lineStart);
+  const headerIndent = indentOf(header.text);
+  if (headerIndent === null) return null;
+
+  const commentStart = findCommentStart(header.text);
+  const code = (commentStart >= 0 ? header.text.slice(0, commentStart) : header.text).trimEnd();
+  const takesSameIndentItems = code.endsWith(":") && !isSequenceItem(code.slice(headerIndent));
+
+  let to = header.to;
+  for (let number = header.number + 1; number <= doc.lines; number += 1) {
+    const line = doc.line(number);
+    const indent = indentOf(line.text);
+    if (indent === null) continue;
+    const inBlock = indent > headerIndent
+      || (takesSameIndentItems && indent === headerIndent && isSequenceItem(line.text.slice(indent)));
+    if (!inBlock) break;
+    to = line.to;
+  }
+  return to > header.to ? { from: header.to, to } : null;
+}
+
+// Returns null for blank lines.
+function indentOf(line: string): number | null {
+  const indent = line.length - line.trimStart().length;
+  return indent === line.length ? null : indent;
+}
+
+// A bare "-" prefix would also match the "---" document separator.
+function isSequenceItem(text: string): boolean {
+  return /^-(\s|$)/.test(text);
 }
 
 function findCommentStart(line: string): number {

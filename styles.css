@@ -97,15 +97,35 @@
   line-height: 1.35;
 }
 
+/* Each level steps 32px (10 + 1 + 21). The guide line sits under the parent's chevron. */
 .yaml-viewer__branch {
   border-left: 1px solid var(--yaml-viewer-border);
-  margin-left: 6px;
-  padding-left: 11px;
+  margin-left: 10px;
+  padding-left: 21px;
 }
 
 .yaml-viewer__branch > summary {
   cursor: pointer;
   list-style-position: outside;
+}
+
+.yaml-viewer__branch > summary::-webkit-details-marker {
+  display: none;
+}
+
+.yaml-viewer__branch > summary::before {
+  background-color: var(--text-muted);
+  content: "";
+  flex: 0 0 auto;
+  height: 12px;
+  -webkit-mask: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><path d='m9 18 6-6-6-6'/></svg>") center / contain no-repeat;
+  mask: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><path d='m9 18 6-6-6-6'/></svg>") center / contain no-repeat;
+  width: 12px;
+}
+
+/* Child combinator: an open ancestor must not rotate the chevrons of closed descendants. */
+.yaml-viewer__branch[open] > summary::before {
+  transform: rotate(90deg);
 }
 
 .yaml-viewer__row {
@@ -121,16 +141,23 @@
   background: var(--background-modifier-hover);
 }
 
+/* 44px = branch padding 21 + summary padding 4 + chevron 12 + row gap 7, so leaf keys align with branch keys. */
 .yaml-viewer__leaf {
   border-left: 1px solid var(--yaml-viewer-border);
-  margin-left: 6px;
-  padding-left: 16px;
+  margin-left: 10px;
+  padding-left: 44px;
 }
 
 .yaml-viewer__key {
-  color: var(--yaml-viewer-key);
-  font-weight: 600;
+  color: var(--text-normal);
+  font-weight: normal;
   overflow-wrap: anywhere;
+}
+
+/* A pseudo-element keeps the colon out of textContent, which the filter searches. */
+.yaml-viewer__leaf > .yaml-viewer__key::after {
+  color: var(--yaml-viewer-muted);
+  content: ":";
 }
 
 .yaml-viewer__badge {
@@ -197,7 +224,7 @@
   color: var(--yaml-viewer-comment);
   font-family: var(--yaml-viewer-code);
   font-size: 0.85em;
-  margin: 2px 0 6px 17px;
+  margin: 2px 0 6px 55px;
 }
 
 .yaml-viewer__document-comments {
@@ -340,36 +367,62 @@
   font-weight: 600;
 }
 
-.yaml-viewer__raw pre {
+/* Edit mode shows the editor in place of the tree and outline. */
+.yaml-viewer--editing .yaml-viewer__tree,
+.yaml-viewer--editing .yaml-viewer__outline,
+.yaml-viewer--editing .yaml-viewer__search,
+.yaml-viewer--editing .yaml-viewer__tree-control,
+.yaml-viewer--editing .yaml-viewer__raw > summary {
+  display: none;
+}
+
+.yaml-viewer--editing .yaml-viewer__body {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.yaml-viewer--editing .yaml-viewer__raw {
+  border-top: 0;
+  margin-top: 0;
+  padding-top: 0;
+}
+
+.yaml-viewer--editing .yaml-viewer__raw .cm-editor {
+  margin-top: 0;
+}
+
+/* Three-class selectors outrank the CodeMirror base theme. */
+.yaml-viewer__raw .cm-editor {
   background: var(--background-secondary);
   border-radius: 6px;
-  font-family: var(--yaml-viewer-code);
   font-size: 0.84em;
-  line-height: 1.35;
   margin-top: 10px;
-  overflow: auto;
+}
+
+.yaml-viewer__raw .cm-editor.cm-focused {
+  outline: 1px solid var(--interactive-accent);
+}
+
+.yaml-viewer__raw .cm-editor .cm-scroller {
+  font-family: var(--yaml-viewer-code);
+  line-height: 1.35;
+}
+
+.yaml-viewer__raw .cm-editor .cm-content {
+  caret-color: var(--text-normal);
   padding: 8px 0;
-  white-space: pre;
 }
 
-.yaml-viewer__source-line {
-  display: flex;
-  min-height: 20px;
-}
-
-.yaml-viewer__line-number {
+.yaml-viewer__raw .cm-editor .cm-gutters {
+  background: transparent;
   border-right: 1px solid var(--yaml-viewer-border);
   color: var(--yaml-viewer-muted);
-  flex: 0 0 44px;
   margin-right: 12px;
-  padding-right: 10px;
-  text-align: right;
-  user-select: none;
 }
 
-.yaml-viewer__source-code {
-  min-width: max-content;
-  padding-right: 16px;
+.yaml-viewer__raw .cm-editor .cm-foldPlaceholder {
+  background: var(--background-modifier-hover);
+  border: 1px solid var(--yaml-viewer-border);
+  color: var(--text-muted);
 }
 
 .yaml-viewer__tok-key {

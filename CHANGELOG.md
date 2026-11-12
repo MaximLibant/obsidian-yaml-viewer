@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Add an edit mode for the raw YAML text, with a toolbar toggle and a default view setting. Files open read-only by default.
+- Add a show comments setting. Turn it off to leave YAML comments out of the tree view. The raw YAML is unchanged.
+- Add fold arrows to the raw YAML editor. Blocks fold by indentation, and files open fully expanded.
+
 ## 0.1.3 - 2026-10-25
 
 - Cross-platform production build.
